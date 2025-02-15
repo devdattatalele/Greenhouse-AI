@@ -1,0 +1,204 @@
+import os
+from notion_client import Client
+import requests
+from bs4 import BeautifulSoup
+import google.generativeai as genai
+from typing import Dict, List
+import json
+
+class JobApplicationScraper:
+    def __init__(self, notion_token: str, notion_database_id: str, gemini_api_key: str):
+        """Initialize the scraper with necessary API credentials"""
+        self.notion = Client(auth=notion_token)
+        self.database_id = notion_database_id
+        genai.configure(api_key=gemini_api_key)
+        self.model = genai.GenerativeModel(
+            model_name="gemini-1.5-pro",
+            generation_config={
+                "temperature": 1.55,
+                "top_p": 0.95,
+                "top_k": 40,
+                "max_output_tokens": 8192,
+            }
+        )
+
+    def get_job_urls_from_notion(self) -> List[Dict]:
+        """Fetch job application URLs from Notion database"""
+        try:
+            print(f"Querying Notion database: {self.database_id}")
+            response = self.notion.databases.query(
+                database_id=self.database_id
+            )
+            
+            print(f"Total results: {len(response['results'])}")
+            
+            jobs = []
+            for page in response["results"]:
+                try:
+                    properties = page.get("properties", {})
+                    url_prop = properties.get("URL", {})
+                    
+                    if url_prop and url_prop.get("type") == "title":
+                        title_items = url_prop.get("title", [])
+                        if title_items and title_items[0].get("text", {}).get("content"):
+                            url = title_items[0]["text"]["content"]
+                            jobs.append({
+                                "page_id": page["id"],
+                                "url": url,
+                                "status": properties.get("Status", {}).get("select", {}).get("name", "")
+                            })
+                            print(f"Added job: {url}")
+                        else:
+                            print(f"No URL content found in title for page {page.get('id', 'unknown')}")
+                    else:
+                        print(f"Invalid URL property structure for page {page.get('id', 'unknown')}")
+                        
+                except Exception as page_error:
+                    print(f"Error processing page: {str(page_error)}")
+                    continue
+            
+            print(f"Total jobs found: {len(jobs)}")
+            return jobs
+            
+        except Exception as e:
+            print(f"Error fetching from Notion: {str(e)}")
+            print(f"Database ID being used: {self.database_id}")
+            return []
+
+    def main():
+        # Load environment variables
+        notion_token = os.getenv("NOTION_TOKEN")
+        notion_database_id = os.getenv("NOTION_DATABASE_ID")
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        
+        # Debug environment variables
+        print("\nChecking environment variables:")
+        print(f"NOTION_TOKEN: {'Set' if notion_token else 'Not set'}")
+        print(f"NOTION_DATABASE_ID: {'Set' if notion_database_id else 'Not set'}")
+        print(f"GEMINI_API_KEY: {'Set' if gemini_api_key else 'Not set'}")
+        
+        if not all([notion_token, notion_database_id, gemini_api_key]):
+            print("\nError: Missing required environment variables")
+            if not notion_token:
+                print("- NOTION_TOKEN is missing")
+            if not notion_database_id:
+                print("- NOTION_DATABASE_ID is missing")
+            if not gemini_api_key:
+                print("- GEMINI_API_KEY is missing")
+            return
+
+    def scrape_application_form(self, url: str) -> Dict:
+        """Scrape the application form data from the job URL"""
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+            response = requests.get(url, headers=headers)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Find the application container
+            app_container = soup.find('div', class_='application--container')
+            if not app_container:
+                return {"error": "Application container not found"}
+            
+            # Extract all form questions
+            questions = []
+            for question in app_container.find_all(['input', 'textarea', 'select']):
+                label = question.find_previous('label')
+                if label:
+                    question_text = label.get_text(strip=True)
+                    required = '*' in label.get_text()
+                    questions.append({
+                        "question": question_text,
+                        "required": required,
+                        "type": question.get('type', 'select' if question.name == 'select' else 'text')
+                    })
+            
+            return {
+                "url": url,
+                "form_html": str(app_container),
+                "questions": questions
+            }
+        except Exception as e:
+            print(f"Error scraping application form: {e}")
+            return {"error": str(e)}
+
+    def prepare_gemini_prompt(self, application_data: Dict) -> str:
+        """Prepare the prompt for Gemini API"""
+        questions_text = "\n".join([
+            f"- {'[Required] ' if q['required'] else ''}{q['question']} ({q['type']})"
+            for q in application_data.get("questions", [])
+        ])
+        
+        prompt = f"""
+Job Application URL: {application_data['url']}
+
+Application Form Questions:
+{questions_text}
+
+Please analyze the application form and provide insights about:
+1. Required qualifications
+2. Key information being requested
+3. Any unique or specific requirements
+4. Recommendations for applicants
+        """
+        return prompt
+
+    def process_job_applications(self):
+        """Main process to handle job applications"""
+        # Get jobs from Notion
+        jobs = self.get_job_urls_from_notion()
+        
+        for job in jobs:
+            print(f"\nProcessing job URL: {job['url']}")
+            
+            # Scrape application form
+            application_data = self.scrape_application_form(job['url'])
+            
+            if "error" in application_data:
+                print(f"Error processing {job['url']}: {application_data['error']}")
+                continue
+            
+            # Prepare and send to Gemini
+            prompt = self.prepare_gemini_prompt(application_data)
+            
+            try:
+                response = self.model.generate_content(prompt)
+                
+                # Update Notion with the analysis
+                self.notion.pages.update(
+                    page_id=job["page_id"],
+                    properties={
+                        "Analysis": {
+                            "rich_text": [
+                                {
+                                    "text": {
+                                        "content": response.text[:2000]  # Notion has a character limit
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                )
+                
+                print(f"Successfully processed and updated Notion for {job['url']}")
+                
+            except Exception as e:
+                print(f"Error with Gemini API or Notion update: {e}")
+
+def main():
+    # Load environment variables
+    notion_token = os.getenv("NOTION_TOKEN")
+    notion_database_id = os.getenv("NOTION_DATABASE_ID")
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    
+    if not all([notion_token, notion_database_id, gemini_api_key]):
+        print("Please set all required environment variables")
+        return
+    
+    # Initialize and run the scraper
+    scraper = JobApplicationScraper(notion_token, notion_database_id, gemini_api_key)
+    scraper.process_job_applications()
+
+if __name__ == "__main__":
+    main()
